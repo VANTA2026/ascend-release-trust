@@ -63,11 +63,62 @@ jobs:
           fi
           echo "architecture: ${ARCH}"
 
-      - name: Check out the TRUST repository (measurement and archive code)
+      # THE TRUST CHECKOUT. `repository:` MUST be given explicitly: in a reusable workflow the
+      # default is `github.repository`, which is the CALLER's repository — that defect made an
+      # earlier run load "trust" code from the candidate repo (run 30571193992, which failed
+      # closed before signing). `job.workflow_*` identifies the workflow file defining THIS job,
+      # so this checks out the trust repository at exactly the reviewed commit.
+      - name: Check out the TRUST repository at the commit that defines this job
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           persist-credentials: false
           path: trust
+
+      - name: Assert the workflow identity and the trust checkout (fail closed)
+        env:
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          EXPECTED_TRUST_REPOSITORY: "VANTA2026/ascend-release-trust"
+          EXPECTED_TRUST_WORKFLOW_FILE: ".github/workflows/_build-source.yml"
+        run: |
+          set -euo pipefail
+          # Job-context values reach the shell only through env, never interpolated into source.
+          if [ "$JOB_WORKFLOW_REPOSITORY" != "$EXPECTED_TRUST_REPOSITORY" ]; then
+            echo "::error::workflow_repository is '$JOB_WORKFLOW_REPOSITORY', expected '$EXPECTED_TRUST_REPOSITORY'"
+            exit 1
+          fi
+          if ! printf '%s' "$JOB_WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::workflow_sha is not 40 lowercase hex: '$JOB_WORKFLOW_SHA'"
+            exit 1
+          fi
+          if [ "$JOB_WORKFLOW_FILE_PATH" != "$EXPECTED_TRUST_WORKFLOW_FILE" ]; then
+            echo "::error::workflow_file_path is '$JOB_WORKFLOW_FILE_PATH', expected '$EXPECTED_TRUST_WORKFLOW_FILE'"
+            exit 1
+          fi
+          if [ -z "$JOB_WORKFLOW_REF" ]; then
+            echo "::error::workflow_ref is empty"
+            exit 1
+          fi
+          echo "workflow_ref (evidence): $JOB_WORKFLOW_REF"
+          ACTUAL_HEAD="$(git -C trust rev-parse HEAD)"
+          if [ "$ACTUAL_HEAD" != "$JOB_WORKFLOW_SHA" ]; then
+            echo "::error::trust checkout HEAD is '$ACTUAL_HEAD', expected '$JOB_WORKFLOW_SHA'"
+            exit 1
+          fi
+          test -d trust/trust_tools || { echo "::error::trust/trust_tools is missing"; exit 1; }
+          for m in attest deterministic_archive git_object_export lock_policy manifest_policy provenance wheelhouse_policy; do
+            test -f "trust/trust_tools/$m.py" || { echo "::error::trust_tools/$m.py is missing"; exit 1; }
+          done
+          # The candidate must live at a distinct path and must never supply trust tooling.
+          if [ -d source ] && [ -e source/trust_tools ]; then
+            echo "::error::the candidate checkout contains trust_tools; refusing"
+            exit 1
+          fi
+          echo "workflow identity verified: $JOB_WORKFLOW_REPOSITORY $JOB_WORKFLOW_FILE_PATH @ $JOB_WORKFLOW_SHA"
 
       - name: Check out the candidate source (payload only)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

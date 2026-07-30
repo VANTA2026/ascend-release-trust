@@ -59,6 +59,26 @@ def _git(repo: str | os.PathLike[str], *args: str, binary: bool = False):
     return result.stdout if binary else result.stdout.decode("utf-8")
 
 
+def resolve_commit(repo: str | os.PathLike[str], rev: str) -> tuple[str, str]:
+    """Confirm ``rev`` names an existing COMMIT object and return ``(commit_sha, tree_sha)``.
+
+    A missing object, a shallow clone that lacks it, or an id that resolves to something other than
+    a commit must fail closed here rather than surface later as an empty export.
+    """
+    if not _is_hex_oid(rev):
+        raise ExportError(f"commit id must be a full 40-hex object id, got {rev!r:.60}")
+    kind = _git(repo, "cat-file", "-t", rev).strip()
+    if kind != "commit":
+        raise ExportError(f"{rev} is a {kind!r} object, expected a commit")
+    resolved = _git(repo, "rev-parse", f"{rev}^{{commit}}").strip()
+    if resolved != rev:
+        raise ExportError(f"{rev} resolved to a different commit {resolved}")
+    tree = _git(repo, "rev-parse", f"{rev}^{{tree}}").strip()
+    if not _is_hex_oid(tree):
+        raise ExportError(f"{rev} has no resolvable tree object")
+    return resolved, tree
+
+
 def read_blob(repo: str | os.PathLike[str], object_id: str) -> bytes:
     """Return a blob's exact stored bytes. No filters, no EOL conversion."""
     if not _is_hex_oid(object_id):

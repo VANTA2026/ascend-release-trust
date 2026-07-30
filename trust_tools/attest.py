@@ -22,9 +22,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-from git_object_export import export_approved_paths, read_blob, list_approved_entries
+from git_object_export import export_approved_paths, read_blob, list_approved_entries, resolve_commit
 from lock_policy import load_validated_lock
-from manifest_policy import ManifestError, compare_passes, sha256_file, verify_archive_against_manifest
+from deterministic_archive import write_deterministic_targz
+from manifest_policy import (ManifestError, compare_passes, sha256_file,
+                             verify_archive_against_manifest, write_manifest)
 from provenance import build_provenance, validate_commit_sha, validate_release_name, validate_repository, write_provenance
 from wheelhouse_policy import evaluate_wheelhouse, policy_manifest
 
@@ -34,6 +36,17 @@ WHEELHOUSE_ARCHIVE = "ascend-wheelhouse-macos-arm64.tar.gz"
 WHEELHOUSE_POLICY_MANIFEST = "ascend-wheelhouse-policy-manifest.json"
 LOCKFILE_NAME = "requirements.macos-arm64-py311.lock.txt"
 PROVENANCE_NAME = "provenance-metadata.json"
+
+# The exact approved release paths. This list MUST equal the APPROVED_PATHS env value in
+# .github/workflows/_build-source.yml — a test asserts they agree, so the two cannot drift.
+APPROVED_SOURCE_PATHS = [
+    "src/backend",
+    "migrations",
+    "alembic.ini",
+    "requirements.txt",
+    "requirements.macos-arm64-py311.lock.txt",
+    "tools/release",
+]
 
 
 class AttestationError(RuntimeError):
@@ -45,6 +58,69 @@ def _env(name: str, *, required: bool = True, default: str = "") -> str:
     if required and not value:
         raise AttestationError(f"required environment variable {name} is unset")
     return value
+
+
+def reconstruct_source_from_commit(candidate_repo: str | os.PathLike[str], backend_sha: str,
+                                   workdir: Path) -> tuple[Path, Path, str]:
+    """Rebuild the canonical source archive from the EXACT attested Git commit.
+
+    Returns ``(archive_path, manifest_path, archive_sha256)``.
+
+    Nothing from the downloaded artifact is an input here. The tree comes from the candidate's Git
+    object database at the attested commit — never a worktree, never the branch head, never the
+    current checkout — and is written into a freshly created directory so no untracked, ignored,
+    generated or cached file can participate.
+    """
+    resolved, tree = resolve_commit(candidate_repo, backend_sha)
+    if resolved != backend_sha:
+        raise AttestationError(f"candidate repo resolved {resolved}, expected the attested {backend_sha}")
+
+    export_root = workdir / "reconstructed"
+    export_approved_paths(candidate_repo, backend_sha, APPROVED_SOURCE_PATHS, export_root)
+
+    manifest_path = workdir / "reconstructed-manifest.json"
+    write_manifest(export_root, manifest_path)
+    archive_path = workdir / "reconstructed.tar.gz"
+    digest = write_deterministic_targz(export_root, archive_path)
+    print(f"  reconstructed from commit {backend_sha} (tree {tree}): sha256={digest}")
+    return archive_path, manifest_path, digest
+
+
+def _require_matches_commit(downloaded_archive: Path, downloaded_manifest: Path,
+                            candidate_repo: str | os.PathLike[str], backend_sha: str) -> str:
+    """THE gate: the signed source must be what the attested commit produces.
+
+    Two independent build jobs agreeing proves they behaved identically — not that they built the
+    right thing. If both were fed the same wrong tree, or both ran a subverted build, their outputs
+    agree perfectly and the old check passed. This reconstructs the tree from Git objects with
+    trust-owned code and demands the bytes match exactly.
+
+    Both SHA-256 equality AND raw byte equality are required. Extracted-tree similarity, manifest
+    similarity, file counts and builder agreement are explicitly NOT accepted as substitutes.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        rebuilt, rebuilt_manifest, rebuilt_digest = reconstruct_source_from_commit(
+            candidate_repo, backend_sha, Path(tmp)
+        )
+        measured = sha256_file(downloaded_archive)
+        if rebuilt_digest != measured:
+            raise AttestationError(
+                "source archive does not match a fresh export of the attested commit: "
+                f"reconstructed {rebuilt_digest}, downloaded {measured} "
+                f"(commit {backend_sha}). Two agreeing build jobs do not prove the tree is correct."
+            )
+        if rebuilt.read_bytes() != Path(downloaded_archive).read_bytes():
+            raise AttestationError(
+                "source archive differs byte-for-byte from the reconstruction despite an equal "
+                "SHA-256 — refusing"
+            )
+        recorded = json.loads(Path(downloaded_manifest).read_text())
+        rebuilt_manifest_doc = json.loads(rebuilt_manifest.read_text())
+        if recorded != rebuilt_manifest_doc:
+            raise AttestationError(
+                "source manifest does not match the manifest of a fresh export of the attested commit"
+            )
+    return rebuilt_digest
 
 
 def _require_canonical(archive: Path, extracted_root: Path, label: str) -> None:
@@ -106,7 +182,17 @@ def run(args: argparse.Namespace) -> int:
     lockfile_sha256 = lock.sha256
     print(f"  lock: {len(lock.distributions)} distributions, sha256={lockfile_sha256}")
 
-    # --- 3. verify the source artifact re-extracts to exactly its manifest -----------------
+    # --- 3. THE RECONSTRUCTION GATE -------------------------------------------------------
+    # Two agreeing build jobs prove only that they behaved identically. Before anything reaches
+    # the signer, rebuild the source from the attested commit's Git objects with trust-owned code
+    # and require exact byte equality. This runs BEFORE the six objects are assembled, so a
+    # mismatch raises and no later step — including signing — is reachable.
+    reconstructed_digest = _require_matches_commit(
+        p1s / SOURCE_ARCHIVE, p1s / SOURCE_MANIFEST, args.candidate_repo, backend_sha
+    )
+    print(f"  source reconstructed from {backend_sha} and byte-identical: {reconstructed_digest}")
+
+    # --- 4. verify the source artifact re-extracts to exactly its manifest -----------------
     shutil.copyfile(p1s / SOURCE_ARCHIVE, out / SOURCE_ARCHIVE)
     shutil.copyfile(p1s / SOURCE_MANIFEST, out / SOURCE_MANIFEST)
     with tempfile.TemporaryDirectory() as tmp:
@@ -114,7 +200,7 @@ def run(args: argparse.Namespace) -> int:
         _require_canonical(out / SOURCE_ARCHIVE, Path(tmp) / "extracted", "source archive")
     print(f"  source round-trip verified and canonical: {recomputed['entry_count']} entries")
 
-    # --- 4. re-run the wheel policy from scratch on the extracted wheelhouse ---------------
+    # --- 5. re-run the wheel policy from scratch on the extracted wheelhouse ---------------
     shutil.copyfile(p1w / WHEELHOUSE_ARCHIVE, out / WHEELHOUSE_ARCHIVE)
     with tempfile.TemporaryDirectory() as tmp:
         from manifest_policy import safe_extract
@@ -139,15 +225,18 @@ def run(args: argparse.Namespace) -> int:
     (out / WHEELHOUSE_POLICY_MANIFEST).write_text(payload, encoding="utf-8")
     print(f"  wheelhouse policy re-derived independently: {len(verdict.accepted)} wheels")
 
-    # --- 5. measure the five objects, then build and measure the sixth ---------------------
+    # --- 6. measure the five objects, then build and measure the sixth ---------------------
     signed_objects = {
-        SOURCE_ARCHIVE: sha256_file(out / SOURCE_ARCHIVE),
+        SOURCE_ARCHIVE: sha256_file(out / SOURCE_ARCHIVE),  # == reconstructed_digest, asserted below
         SOURCE_MANIFEST: sha256_file(out / SOURCE_MANIFEST),
         WHEELHOUSE_ARCHIVE: sha256_file(out / WHEELHOUSE_ARCHIVE),
         WHEELHOUSE_POLICY_MANIFEST: sha256_file(out / WHEELHOUSE_POLICY_MANIFEST),
         LOCKFILE_NAME: sha256_file(out / LOCKFILE_NAME),
         PROVENANCE_NAME: "0" * 64,  # placeholder; replaced below once the document exists
     }
+
+    if signed_objects[SOURCE_ARCHIVE] != reconstructed_digest:
+        raise AttestationError("source digest drifted from the reconstruction after assembly")
 
     document = build_provenance(
         backend_sha=backend_sha,

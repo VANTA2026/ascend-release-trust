@@ -216,18 +216,28 @@ jobs:
           fetch-depth: 0
           path: source
 
-      - name: Prove the commit is contained in the approved release line
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.14"
+
+      # Ancestry is proven over the authenticated REST API, NOT by `git fetch`. The candidate
+      # checkout is created with persist-credentials: false so no token is left on disk; an
+      # authenticated fetch inside it is therefore impossible (that is exactly how run
+      # 30578134633 failed). Restoring credentials to git would fix the symptom by removing the
+      # reason the checkout is safe. The API proof and the checkout are SEPARATE controls:
+      # the API proves release-line containment, the checkout supplies exact Git objects.
+      #
+      # The repository and branch are fixed constants inside the trust-owned module - they are
+      # not caller inputs, so a caller cannot redirect the proof at something it controls.
+      - name: Prove release-line containment over the authenticated REST API
         env:
-          IN_BACKEND_SHA: ${{ inputs.backend_sha }}
+          # Held only in this step's environment: never on a command line, never written to a
+          # file, never placed in a URL, never put into Git configuration, never in an artifact.
+          GITHUB_API_TOKEN: ${{ github.token }}
+          BACKEND_SHA: ${{ inputs.backend_sha }}
         run: |
           set -euo pipefail
-          cd source
-          git fetch --no-tags origin "+${REQUIRED_RELEASE_REF}:refs/remotes/approved/line"
-          if ! git merge-base --is-ancestor "$IN_BACKEND_SHA" refs/remotes/approved/line; then
-            echo "::error::${IN_BACKEND_SHA} is NOT contained in ${REQUIRED_RELEASE_REF} — refusing"
-            exit 1
-          fi
-          echo "ancestry proven: ${IN_BACKEND_SHA} is contained in ${REQUIRED_RELEASE_REF}"
+          python trust/trust_tools/release_line_policy.py
 
       # Narrowly scoped and explicitly NON-AUTHORITATIVE. The schema is bound by REQUIRED_BACKEND_SHA
       # (a fixed, operator-approved commit), not by anything measured on this Linux runner, and no

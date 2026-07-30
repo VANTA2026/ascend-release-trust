@@ -70,6 +70,29 @@ def _normalise(rel: str) -> str:
     return unicodedata.normalize("NFC", rel)
 
 
+def exclusion_reason(rel_posix_path: str) -> str | None:
+    """Why the archive filter would drop this path, or None if it would be kept.
+
+    The filter exists to stop *build residue* — bytecode and tool caches created on the runner —
+    from entering an artifact that must be byte-reproducible. It was never meant to silently drop
+    something a human deliberately committed. Callers that enumerate the approved tree from Git use
+    this to REFUSE such a commit rather than ship a quietly different tree.
+    """
+    parts = tuple(p for p in PurePosixPath(rel_posix_path).parts if p not in (".", ""))
+    if not parts:
+        return None
+    for part in parts[:-1]:
+        if part in EXCLUDED_DIR_NAMES:
+            return f"lies inside excluded directory {part!r}"
+    name = parts[-1]
+    if name in EXCLUDED_DIR_NAMES:
+        return f"is an excluded directory name {name!r}"
+    if name.endswith(EXCLUDED_SUFFIXES):
+        suffix = next(s for s in EXCLUDED_SUFFIXES if name.endswith(s))
+        return f"has excluded suffix {suffix!r}"
+    return None
+
+
 def _is_excluded(rel_parts: tuple[str, ...], name: str) -> bool:
     if any(part in EXCLUDED_DIR_NAMES for part in rel_parts):
         return True

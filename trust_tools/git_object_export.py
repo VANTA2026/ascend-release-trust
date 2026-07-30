@@ -48,11 +48,49 @@ class TreeEntry:
         return self.mode == MODE_EXEC
 
 
+# Environment variables that can redirect how Git resolves objects, finds the repository, or is
+# configured. Every one of them is REMOVED from the environment handed to git, so an inherited or
+# hostile value on the runner cannot change what "the attested commit" means.
+_UNSAFE_GIT_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+_UNSAFE_GIT_ENV = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES",
+    "GIT_ATTR_NOSYSTEM", "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS", "GIT_REPLACE_REF_BASE",
+})
+
+# Retained deliberately: PATH (needed to find the git binary), HOME (git refuses some operations
+# without it), and LANG/LC_ALL forced to C so any human-readable output we parse is stable. Nothing
+# retained can redirect object lookup.
+_RETAINED_GIT_ENV = ("PATH", "HOME")
+
+
+def _git_env() -> dict[str, str]:
+    """Build the controlled environment for every security-relevant git invocation.
+
+    GIT_NO_REPLACE_OBJECTS=1 is the control that matters here. Without it, a ``refs/replace/<oid>``
+    entry silently substitutes a different object *under the attested id* — ``cat-file -t`` still
+    says "commit" and ``rev-parse <sha>^{commit}`` still echoes the requested sha, while
+    ``^{tree}`` hands back the forged tree. Reconstruction would then faithfully rebuild the wrong
+    source. Relying on "the checkout refspec happens not to fetch refs/replace/*" is a property of
+    the caller, not of this code; the environment variable is the control.
+    """
+    env: dict[str, str] = {name: os.environ[name] for name in _RETAINED_GIT_ENV if name in os.environ}
+    env.setdefault("PATH", "/usr/bin:/bin")
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"      # never block waiting for credentials
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    return env
+
+
 def _git(repo: str | os.PathLike[str], *args: str, binary: bool = False):
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "--no-replace-objects", "-C", str(repo), *args],
         capture_output=True,
         check=False,
+        env=_git_env(),
     )
     if result.returncode != 0:
         raise ExportError(f"git {' '.join(args[:3])} failed: {result.stderr.decode('utf-8', 'replace').strip()}")

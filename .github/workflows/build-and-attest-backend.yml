@@ -1,0 +1,281 @@
+# .github/workflows/build-and-attest-backend.yml
+#
+# PUBLIC trust repository: VANTA2026/ascend-release-trust
+#
+# THE TRUSTED WORKFLOW. Callers reference it by IMMUTABLE FULL COMMIT SHA. Fulcio records that
+# reference in the signing certificate's `job_workflow_ref` claim, and the host verification policy
+# pins it. A candidate that edits its own caller cannot forge provenance — it can only produce a
+# certificate identity the host refuses.
+#
+# TRUST BOUNDARY
+# --------------
+# Every measurement, decision and artifact is produced by `trust_tools/` from THIS repository at the
+# pinned commit. The candidate repository supplies PAYLOAD ONLY: its Git objects. Nothing under
+# VANTA2026/ASCEND-OS is ever executed, imported, or believed. In particular the candidate's own
+# `tools/release/*` is shipped as payload and never runs here.
+#
+# Reported values from build jobs are never promotion authority: `compare-and-sign` downloads BOTH
+# passes of BOTH artifacts and measures every digest itself.
+#
+# This workflow does not deploy, does not touch a production host, does not request production
+# credentials, does not read a production database, and does not publish artifacts publicly.
+
+name: Build and attest ASCEND backend
+
+on:
+  workflow_call:
+    inputs:
+      backend_sha:
+        description: "EXACT 40-character lowercase hex commit SHA of the backend to build and attest"
+        required: true
+        type: string
+      source_repository:
+        description: "Private source repository, owner/name"
+        required: true
+        type: string
+      release_name:
+        description: "Human label recorded in provenance metadata (strict charset, max 64)"
+        required: false
+        default: "build-616-backend-d1f4"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # --- the only release this workflow will build -------------------------------------------
+  REQUIRED_BACKEND_SHA: "50cbe173ea55fea6943c40765ab64dde99406c2e"
+  REQUIRED_RELEASE_REF: "refs/heads/release/build-616-backend-d1f4"
+  EXPECTED_SOURCE_REPOSITORY: "VANTA2026/ASCEND-OS"
+  # --- exact interpreters ------------------------------------------------------------------
+  TARGET_RUNTIME_PYTHON: "3.11.15"
+  BUILD_TOOL_PYTHON: "3.13.14"
+  LOCKFILE: "requirements.macos-arm64-py311.lock.txt"
+
+jobs:
+  # =========================================================================================
+  # 1. Validate every input through trust-owned validators before it reaches any shell.
+  # =========================================================================================
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Refuse a non GitHub-hosted runner
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "::error::refusing a non GitHub-hosted runner (RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset})"
+            exit 1
+          fi
+
+      - name: Check out the TRUST repository (this repo, at the pinned commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: trust
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.14"
+
+      # Inputs are passed as ENVIRONMENT VARIABLES, never interpolated into shell source.
+      # `${{ }}` is textual substitution into the generated script: a value containing a quote or a
+      # backtick would become shell code. Through `env:` the value is data.
+      - name: Validate all inputs with trust-owned validators
+        env:
+          IN_BACKEND_SHA: ${{ inputs.backend_sha }}
+          IN_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          IN_RELEASE_NAME: ${{ inputs.release_name }}
+        run: |
+          set -euo pipefail
+          cd trust
+          python trust_tools/provenance.py sha         "$IN_BACKEND_SHA"
+          python trust_tools/provenance.py repository  "$IN_SOURCE_REPOSITORY"
+          python trust_tools/provenance.py release_name "$IN_RELEASE_NAME"
+          if [ "$IN_BACKEND_SHA" != "$REQUIRED_BACKEND_SHA" ]; then
+            echo "::error::this workflow builds only ${REQUIRED_BACKEND_SHA}"
+            exit 1
+          fi
+          if [ "$IN_SOURCE_REPOSITORY" != "$EXPECTED_SOURCE_REPOSITORY" ]; then
+            echo "::error::source_repository is not the approved ${EXPECTED_SOURCE_REPOSITORY}"
+            exit 1
+          fi
+          echo "inputs validated"
+
+  # =========================================================================================
+  # 2. Ancestry is ENFORCED, not observed: the commit must be contained in the release line.
+  # =========================================================================================
+  ancestry:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the candidate source (payload only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.backend_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          path: source
+
+      - name: Prove the commit is contained in the approved release line
+        env:
+          IN_BACKEND_SHA: ${{ inputs.backend_sha }}
+        run: |
+          set -euo pipefail
+          cd source
+          git fetch --no-tags origin "+${REQUIRED_RELEASE_REF}:refs/remotes/approved/line"
+          if ! git merge-base --is-ancestor "$IN_BACKEND_SHA" refs/remotes/approved/line; then
+            echo "::error::${IN_BACKEND_SHA} is NOT contained in ${REQUIRED_RELEASE_REF} — refusing"
+            exit 1
+          fi
+          echo "ancestry proven: ${IN_BACKEND_SHA} is contained in ${REQUIRED_RELEASE_REF}"
+
+      # Narrowly scoped and explicitly NON-AUTHORITATIVE. The schema is bound by REQUIRED_BACKEND_SHA
+      # (a fixed, operator-approved commit), not by anything measured on this Linux runner, and no
+      # unhashed dependency resolution participates in promotion. This step only records facts.
+      - name: Record schema facts (informational, no dependency installation)
+        env:
+          IN_BACKEND_SHA: ${{ inputs.backend_sha }}
+        run: |
+          set -euo pipefail
+          cd source
+          echo "commit: $(git rev-parse HEAD)"
+          echo "migration files: $(find migrations/versions -maxdepth 1 -name '*.py' -type f | wc -l | tr -d ' ')"
+          if [ -f migrations/versions/d1f4a9c2e5b8_set_log_idempotency_unique.py ]; then
+            echo "d1f4a9c2e5b8 migration present: yes"
+          else
+            echo "d1f4a9c2e5b8 migration present: no"
+          fi
+          echo "::notice::schema facts are informational; the schema is bound by the pinned commit and re-proven on the production host"
+
+  # =========================================================================================
+  # 3. Two independent passes per artifact, each on its own fresh runner.
+  # =========================================================================================
+  build-source-pass-1:
+    needs: ancestry
+    uses: ./.github/workflows/_build-source.yml
+    with:
+      backend_sha: ${{ inputs.backend_sha }}
+      source_repository: ${{ inputs.source_repository }}
+      pass_label: "1"
+
+  build-source-pass-2:
+    needs: ancestry
+    uses: ./.github/workflows/_build-source.yml
+    with:
+      backend_sha: ${{ inputs.backend_sha }}
+      source_repository: ${{ inputs.source_repository }}
+      pass_label: "2"
+
+  build-wheelhouse-pass-1:
+    needs: ancestry
+    uses: ./.github/workflows/_build-wheelhouse.yml
+    with:
+      backend_sha: ${{ inputs.backend_sha }}
+      source_repository: ${{ inputs.source_repository }}
+      pass_label: "1"
+
+  build-wheelhouse-pass-2:
+    needs: ancestry
+    uses: ./.github/workflows/_build-wheelhouse.yml
+    with:
+      backend_sha: ${{ inputs.backend_sha }}
+      source_repository: ${{ inputs.source_repository }}
+      pass_label: "2"
+
+  # =========================================================================================
+  # 4. Measure everything again, here, from bytes. Then sign exactly six objects.
+  # =========================================================================================
+  compare-and-sign:
+    needs:
+      - build-source-pass-1
+      - build-source-pass-2
+      - build-wheelhouse-pass-1
+      - build-wheelhouse-pass-2
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the TRUST repository (measurement code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: trust
+
+      - name: Check out the candidate source (payload only, for exact Git objects)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.backend_sha }}
+          persist-credentials: false
+          path: source
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.14"
+
+      # BOTH passes of BOTH artifacts.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: source-1, path: /tmp/p/source-1 }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: source-2, path: /tmp/p/source-2 }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: wheelhouse-1, path: /tmp/p/wheelhouse-1 }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: wheelhouse-2, path: /tmp/p/wheelhouse-2 }
+
+      - name: Independently measure and compare both passes, then assemble provenance
+        id: attest
+        env:
+          IN_BACKEND_SHA: ${{ inputs.backend_sha }}
+          IN_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          IN_RELEASE_NAME: ${{ inputs.release_name }}
+          DRIVER_PYTHON_1: ${{ needs.build-wheelhouse-pass-1.outputs.driver_python }}
+          DRIVER_PYTHON_2: ${{ needs.build-wheelhouse-pass-2.outputs.driver_python }}
+          TRUST_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/out
+          PYTHONPATH="$PWD/trust/trust_tools" python "$PWD/trust/trust_tools/attest.py" \
+            --source-pass1 /tmp/p/source-1 \
+            --source-pass2 /tmp/p/source-2 \
+            --wheelhouse-pass1 /tmp/p/wheelhouse-1 \
+            --wheelhouse-pass2 /tmp/p/wheelhouse-2 \
+            --candidate-repo "$PWD/source" \
+            --output /tmp/out
+
+      - name: Install Cosign (v4 installer, pinned Cosign v3 toolchain)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.2"
+
+      - name: Sign exactly six independent objects
+        run: |
+          set -euo pipefail
+          cd /tmp/out
+          cosign version
+          for f in ascend-backend-source.tar.gz \
+                   ascend-backend-source-manifest.json \
+                   ascend-wheelhouse-macos-arm64.tar.gz \
+                   ascend-wheelhouse-policy-manifest.json \
+                   requirements.macos-arm64-py311.lock.txt \
+                   provenance-metadata.json; do
+            test -f "$f" || { echo "::error::signed object $f is missing"; exit 1; }
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+            echo "signed: $f"
+          done
+          BUNDLES=(./*.cosign.bundle)
+          if [ "${#BUNDLES[@]}" -ne 6 ]; then
+            echo "::error::expected exactly 6 Sigstore bundles, found ${#BUNDLES[@]}"
+            exit 1
+          fi
+          echo "six objects signed"
+
+      - name: Upload the signed release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ascend-backend-attested-${{ inputs.backend_sha }}
+          path: /tmp/out/*
+          if-no-files-found: error
+          retention-days: 30

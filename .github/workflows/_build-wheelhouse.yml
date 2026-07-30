@@ -1,0 +1,183 @@
+# .github/workflows/_build-wheelhouse.yml
+#
+# PUBLIC trust repository: VANTA2026/ascend-release-trust
+#
+# Produces the macOS arm64 / CPython 3.11.15 wheelhouse for ONE pass, on a fresh runner. Called
+# twice, independently.
+#
+# This job has NO promotion authority. `compare-and-sign` extracts the wheelhouse, re-runs the
+# trust-owned wheel policy from scratch, and re-derives the policy manifest; if this job's manifest
+# disagrees with that re-derivation, the release is refused. Nothing printed here is trusted.
+#
+# TARGET RUNTIME PYTHON vs BUILD DRIVER PYTHON
+# -------------------------------------------
+# `actions/python-versions` publishes no Darwin/arm64 build of CPython 3.11.15, so this job cannot
+# ask setup-python for it. Rather than silently substitute another production Python, the two roles
+# are separated and recorded separately:
+#
+#   TARGET_RUNTIME_PYTHON = 3.11.15  what the backend runs on and what the lock is for. The ONLY
+#                                    interpreter whose runtime compatibility is claimed.
+#   DRIVER_PYTHON         = 3.13.14  drives `pip download` and nothing else. Exact, not floating.
+#
+# This is sound only because wheels are selected by EXPLICIT target metadata (--platform,
+# --implementation, --python-version, --abi), never by the running interpreter, and because every
+# wheel must match a hash the lock permits FOR THAT DISTRIBUTION. A wheelhouse is not evidence that
+# the runtime works; the offline installation gate on exact 3.11.15 is.
+
+name: Build wheelhouse (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      backend_sha:
+        required: true
+        type: string
+      source_repository:
+        required: true
+        type: string
+      pass_label:
+        required: true
+        type: string
+    outputs:
+      driver_python:
+        description: "Recorded for provenance only; not a promotion measurement."
+        value: ${{ jobs.wheelhouse.outputs.driver_python }}
+
+permissions:
+  contents: read
+
+env:
+  REQUIRED_BACKEND_SHA: "50cbe173ea55fea6943c40765ab64dde99406c2e"
+  EXPECTED_SOURCE_REPOSITORY: "VANTA2026/ASCEND-OS"
+  TARGET_RUNTIME_PYTHON: "3.11.15"
+  DRIVER_PYTHON: "3.13.14"
+  PINNED_PIP: "26.1.2"
+  TARGET_PLATFORM_TAGS: "macosx_11_0_arm64 macosx_12_0_arm64 macosx_14_0_arm64"
+  TARGET_ABI: "cp311"
+  TARGET_IMPL: "cp"
+  TARGET_PYTHON_TAG: "311"
+  LOCKFILE: "requirements.macos-arm64-py311.lock.txt"
+
+jobs:
+  wheelhouse:
+    runs-on: macos-15
+    outputs:
+      driver_python: ${{ steps.driver.outputs.version }}
+    steps:
+      - name: Refuse a non GitHub-hosted runner
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "::error::refusing a non GitHub-hosted runner (RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset})"
+            exit 1
+          fi
+
+      - name: Refuse a non-arm64 runner
+        run: |
+          set -euo pipefail
+          ARCH="$(uname -m)"
+          [ "$ARCH" = "arm64" ] || { echo "::error::expected an arm64 runner, got ${ARCH}"; exit 1; }
+          echo "architecture: ${ARCH}"
+
+      - name: Check out the TRUST repository (policy and archive code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: trust
+
+      - name: Check out the candidate source (payload only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.backend_sha }}
+          persist-credentials: false
+          path: source
+
+      # Exact patch version, not a floating "3.13".
+      - name: Set up the exact DRIVER Python (download driver only)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.14"
+
+      - name: Independently validate this job's inputs and pin the toolchain
+        id: driver
+        env:
+          IN_BACKEND_SHA: ${{ inputs.backend_sha }}
+          IN_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          IN_PASS_LABEL: ${{ inputs.pass_label }}
+        run: |
+          set -euo pipefail
+          cd trust
+          python trust_tools/provenance.py sha        "$IN_BACKEND_SHA"
+          python trust_tools/provenance.py repository "$IN_SOURCE_REPOSITORY"
+          python trust_tools/provenance.py pass_label "$IN_PASS_LABEL"
+          [ "$IN_BACKEND_SHA" = "$REQUIRED_BACKEND_SHA" ] || { echo "::error::only ${REQUIRED_BACKEND_SHA} may be built"; exit 1; }
+          [ "$IN_SOURCE_REPOSITORY" = "$EXPECTED_SOURCE_REPOSITORY" ] || { echo "::error::unexpected source repository"; exit 1; }
+          MEASURED="$(python -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')"
+          [ "$MEASURED" = "$DRIVER_PYTHON" ] || { echo "::error::driver Python is ${MEASURED}, expected ${DRIVER_PYTHON}"; exit 1; }
+          python -m pip install --quiet --disable-pip-version-check "pip==${PINNED_PIP}"
+          MEASURED_PIP="$(python -m pip --version | awk '{print $2}')"
+          [ "$MEASURED_PIP" = "$PINNED_PIP" ] || { echo "::error::pip is ${MEASURED_PIP}, expected ${PINNED_PIP}"; exit 1; }
+          echo "version=${MEASURED}" >> "$GITHUB_OUTPUT"
+          echo "driver Python ${MEASURED}, pip ${MEASURED_PIP}; target runtime ${TARGET_RUNTIME_PYTHON}"
+
+      - name: Take the lockfile from exact Git bytes and validate it
+        env:
+          IN_BACKEND_SHA: ${{ inputs.backend_sha }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/trust/trust_tools"
+          python trust/trust_tools/git_object_export.py "$PWD/source" "$IN_BACKEND_SHA" /tmp/lock "$LOCKFILE"
+          python trust/trust_tools/lock_policy.py "/tmp/lock/${LOCKFILE}"
+
+      - name: Download wheels for the TARGET runtime, using explicit target metadata
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/wheelhouse
+          PLATFORM_ARGS=()
+          for tag in ${TARGET_PLATFORM_TAGS}; do PLATFORM_ARGS+=(--platform "$tag"); done
+          python -m pip download \
+            --require-hashes \
+            --only-binary=:all: \
+            --no-cache-dir \
+            "${PLATFORM_ARGS[@]}" \
+            --implementation "${TARGET_IMPL}" \
+            --python-version "${TARGET_PYTHON_TAG}" \
+            --abi "${TARGET_ABI}" \
+            -r "/tmp/lock/${LOCKFILE}" \
+            -d /tmp/wheelhouse
+          # --only-binary=:all: must never be loosened. A dependency with no compatible binary wheel
+          # is a decision for a human, not a reason to build an sdist on a release runner.
+
+      - name: Apply the trust-owned wheel policy and emit the policy manifest
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/trust/trust_tools"
+          # Filename parsing, internal METADATA, internal WHEEL tags, per-distribution hash
+          # association, universal2 policy and exactly-one-wheel-per-locked-distribution.
+          # No grep, no substring matching.
+          python trust/trust_tools/wheelhouse_policy.py \
+            "/tmp/lock/${LOCKFILE}" \
+            /tmp/wheelhouse \
+            /tmp/ascend-wheelhouse-policy-manifest.json
+
+      - name: Build the wheelhouse archive with the trust-owned deterministic writer
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, os.path.join(os.getcwd(), "trust", "trust_tools"))
+          from deterministic_archive import write_deterministic_targz
+          digest = write_deterministic_targz("/tmp/wheelhouse", "/tmp/ascend-wheelhouse-macos-arm64.tar.gz")
+          print(f"archive_sha256={digest}")
+          PY
+
+      - name: Upload this pass (an artifact, not a measurement)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheelhouse-${{ inputs.pass_label }}
+          path: |
+            /tmp/ascend-wheelhouse-macos-arm64.tar.gz
+            /tmp/ascend-wheelhouse-policy-manifest.json
+          if-no-files-found: error
+          retention-days: 7

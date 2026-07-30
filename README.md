@@ -21,7 +21,12 @@ not the problem.
 So the trust boundary is now drawn around *code*, not around files:
 
 - this repository is **public**, so branch protection is available and everything is auditable;
-- `main` is **protected**, so the workflow and its tools cannot be changed unilaterally;
+- `main` is **protected**: direct pushes are rejected, every change must arrive through a pull
+  request, commits must carry a verified signature, history stays linear, force-pushes and branch
+  deletion are disabled, and administrators are **not** exempt. State precisely what that buys:
+  the protection currently requires **zero approving reviews**, so one maintainer can merge their
+  own pull request. It prevents unreviewable direct pushes and unsigned commits; it is not a
+  second-person control;
 - callers reference the workflow by **immutable full commit SHA**, never a branch or tag;
 - Sigstore records that SHA in the signing certificate, so the host policy pins the exact reviewed
   revision of the exact reviewed code.
@@ -112,10 +117,12 @@ only `contents: read`; `id-token: write` is granted to the signing job alone.
 
 ## Changing this repository
 
-Any change requires a pull request and review on the protected `main` branch. After merging, the
-caller in the private repository must be re-pinned to the new commit SHA **and** the host
-verification policy updated to the new identity — deliberately, so a change can never take effect
-silently.
+Any change must arrive through a pull request on the protected `main` branch and carry a verified
+signature; direct pushes are rejected and administrators are not exempt. **Approving reviews are
+not currently required**, so this is a merge-path and signature control, not a second-person
+control - do not describe it as one. After merging, the caller in the private repository must
+be re-pinned to the new commit SHA **and** the host verification policy given the new
+release-specific signer SHA - deliberately, so a change can never take effect silently.
 
 ## Tests
 

@@ -3,103 +3,125 @@
 Verification happens on the operator's Mac, before anything is promoted. The host trusts the
 **Fulcio certificate identity**, not any field inside a downloaded document.
 
-## 0. Bootstrap the verifier
+> **This document does not verify anything by itself.** Verification is performed by
+> `trust_tools/verify_release.py` from this repository, which exits nonzero on any mismatch. A
+> previous revision of this file described checks in prose that did not execute; both of those
+> defects were found by a real proof-of-concept and are recorded in section 0.
 
-The verifier itself must be trusted before it can vouch for anything.
+## 0. What was wrong before, and why it matters
+
+Run 30579291932 produced a genuine, fully attested release. Following the previous revision of this
+document against that evidence **refused all six objects**, for two independent reasons:
+
+1. **The expected identity was pinned to a mutable branch.** It was built as
+   `...build-and-attest-backend.yml@refs/heads/main`, while the real certificate SAN ends in the
+   immutable trust-workflow commit. Worse, `@refs/heads/main` is exactly the identity a
+   candidate-authored caller obtains by writing `uses: <trust-repo>/<workflow>@main` — so the
+   document pinned the one string an attacker can mint, and rejected the one the honest build
+   produces.
+2. **The step called "the trust anchor" could not fail.** It ran
+   `cosign verify-blob ... | grep -i job_workflow_ref`. cosign prints `Verified OK` and nothing
+   else, so the grep matched nothing, compared nothing, and always "passed".
+
+A third, smaller defect: `--certificate-github-workflow-repository` was given the **trust**
+repository. That OID records the **source** repository of the run. Passing the trust repo refuses a
+genuine release.
+
+The corrections below are executable and were exercised against the preserved evidence.
+
+## 1. Authenticate the verifier
 
 ```sh
-# Cosign v3, obtained from the official release and checked against its published digest.
-COSIGN=/usr/local/bin/cosign-v3.1.2          # absolute path, never resolved through $PATH
-shasum -a 256 "$COSIGN"                       # compare with the checksum from the v3.1.2 release
-"$COSIGN" version
+COSIGN=/Users/admin/ascend-ops/verifier/cosign     # absolute path, never resolved through $PATH
+shasum -a 256 "$COSIGN"                            # must equal the digest recorded at install time
+"$COSIGN" version                                  # must report v3.1.2
 ```
 
 Always invoke Cosign by **absolute path**. A bare name is resolved through the inherited `PATH`,
 which a candidate-adjacent process could influence — that exact defect sank an earlier candidate.
 
-## 1. Pin the certificate identity
+## 2. Verify a release — the only supported procedure
 
 ```sh
-TRUST_REPO=VANTA2026/ascend-release-trust
-WORKFLOW=.github/workflows/build-and-attest-backend.yml
-TRUST_SHA=<TRUST_WORKFLOW_SHA>               # the exact reviewed commit, never a branch or tag
-
-IDENTITY="https://github.com/${TRUST_REPO}/${WORKFLOW}@refs/heads/main"
-ISSUER="https://token.actions.githubusercontent.com"
+python3 trust_tools/verify_release.py \
+  --evidence     /path/to/downloaded/artifact \
+  --trust-sha    <TRUST_WORKFLOW_SHA_THAT_SIGNED_THIS_RELEASE> \
+  --trusted-root /Users/admin/ascend-ops/verifier/trustroot/trusted_root.json \
+  --cosign       /Users/admin/ascend-ops/verifier/cosign
+echo "exit=$?"      # 0 = every object verified; anything else = REFUSED
 ```
 
-Verify each object with the identity pinned:
+**The exit status is the verdict.** Do not read the output and decide. Do not continue on nonzero.
 
-```sh
-for f in ascend-backend-source.tar.gz \
-         ascend-backend-source-manifest.json \
-         ascend-wheelhouse-macos-arm64.tar.gz \
-         ascend-wheelhouse-policy-manifest.json \
-         requirements.macos-arm64-py311.lock.txt \
-         provenance-metadata.json; do
-  "$COSIGN" verify-blob \
-    --bundle "${f}.cosign.bundle" \
-    --certificate-oidc-issuer "$ISSUER" \
-    --certificate-identity "$IDENTITY" \
-    --certificate-github-workflow-repository "$TRUST_REPO" \
-    "$f" || { echo "REFUSED: $f"; exit 1; }
-done
+`--trust-sha` is **release-specific**: it is the trust-workflow commit that signed *that* release,
+which you take from the release record — never from the trust repository's current head. Verifying
+old artifacts against today's head would silently accept or reject the wrong thing.
+
+For the preserved run-30579291932 evidence the value is exactly:
+
+```
+dd32f6553de1d7a2f78c9e313f379e81bf9ee725
 ```
 
-**All six must verify.** Five verifying and one missing is a refusal, not a partial pass.
+### What the verifier enforces
 
-## 2. The workflow identity comes from the certificate, not from the document
+| Rule | Enforcement |
+|---|---|
+| Identity ends in an **immutable 40-hex commit** | refused before any artifact is opened; branches, tags, `HEAD`, symbolic refs, abbreviated and uppercase SHAs all fail closed |
+| Exact certificate SAN | `cosign --certificate-identity` (an enforcing flag: nonzero on mismatch) **and** an independent certificate parse in the verifier |
+| OIDC issuer | `https://token.actions.githubusercontent.com`, checked by cosign and independently |
+| Source repository claim | `VANTA2026/ASCEND-OS` — the **caller**, which is what OID 1.3.6.1.4.1.57264.1.12 records |
+| Build-signer URI | independently compared to the expected identity |
+| Rekor inclusion | every bundle must carry a transparency-log entry with an inclusion proof and checkpoint |
+| Artifact digests | each object measured and compared with the digest recorded in the signed provenance |
+| Exactly six objects | a missing, extra or unbundled object is a refusal |
 
-`provenance-metadata.json` records a `trust_workflow_ref` field. It is **not** the trust anchor and
-the document says so itself. The anchor is the `job_workflow_ref` claim Fulcio places in the signing
-certificate. Read it from the certificate:
+Two independent mechanisms must both agree: cosign's exit status, and the verifier's own parse of
+the certificate. Neither is trusted alone, and no verdict is ever derived from tool stdout.
 
-```sh
-"$COSIGN" verify-blob --bundle provenance-metadata.json.cosign.bundle \
-  --certificate-oidc-issuer "$ISSUER" --certificate-identity "$IDENTITY" \
-  --certificate-github-workflow-repository "$TRUST_REPO" \
-  provenance-metadata.json 2>&1 | grep -i 'job_workflow_ref'
-```
+### Flags that are refused outright
 
-Require the SHA embedded there to equal `$TRUST_SHA`. A caller pointed at a different workflow
-produces a different claim, and this check refuses it.
+`--certificate-identity-regexp`, `--certificate-oidc-issuer-regexp`, `--insecure-ignore-tlog`,
+`--insecure-ignore-sct`, and `--offline`. The verifier raises rather than run any of them. (The
+first two would loosen exact identity matching; the next two would discard transparency-log and SCT
+evidence; `--offline` no longer exists in cosign v3 — see section 4.)
 
-## 3. Cross-check the documents against the bytes
+## 3. Cross-check the release against what you approved
 
 ```sh
 python3 - <<'PY'
-import hashlib, json, pathlib
+import json, pathlib
 doc = json.loads(pathlib.Path("provenance-metadata.json").read_text())
-for name, recorded in doc["signed_objects"].items():
-    if recorded == "self":
-        continue
-    measured = hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
-    assert measured == recorded, f"{name}: measured {measured}, provenance says {recorded}"
-print("all recorded digests match the bytes on disk")
+print("backend_commit:", doc["backend_commit"])
+print("release_ref:   ", doc["release_ref"])
 PY
 ```
 
-Then compare `doc["backend_commit"]` with the commit you approved. If it differs, stop.
+Compare `backend_commit` with the commit you approved. If it differs, stop. The verifier already
+proved the document's own digests match the bytes; this step is about *which release* it is.
 
-## 4. Offline verification, cold cache
+## 4. Cold-cache / air-gapped verification
 
-Sigstore bundles carry the certificate and the transparency-log inclusion proof, so verification
-needs no network:
+`--offline` was removed in cosign v3 — passing it is an error, not a hardening step. Airgapped
+verification uses a **pinned trusted root**:
 
 ```sh
-"$COSIGN" verify-blob --offline --bundle "${f}.cosign.bundle" ... "$f"
+# ONCE, on a network, then keep the file and record its digest:
+env -i HOME="$TMP" PATH=/usr/bin:/bin "$COSIGN" initialize
+cp "$TMP/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/trusted_root.json" \
+   /Users/admin/ascend-ops/verifier/trustroot/trusted_root.json
+shasum -a 256 /Users/admin/ascend-ops/verifier/trustroot/trusted_root.json
 ```
 
-Cold-cache caveat, stated plainly: `--offline` validates the bundle's inclusion proof against the
-**Rekor public key embedded in the trust root**. If the local Sigstore trust root has never been
-initialised on this host, obtain it once, on a network, from the official TUF root, and record its
-digest. After that, verification is genuinely offline. Do not treat a first-ever offline run as
-proof of anything until that root is pinned.
+Thereafter the section-2 command verifies with **no network at all**. This was exercised with an
+empty `HOME`, no warmed Sigstore cache, and every proxy blackholed: 6/6 verified. A missing, empty,
+malformed or altered trusted root is refused.
 
 ## 5. Build the runtime ON THE HOST — never copy a venv
 
 ```sh
-REL=/Users/admin/ascend-releases/<release-id>
+RELEASE_ID="<substitute the content-addressed release id>"
+REL="/Users/admin/ascend-releases/${RELEASE_ID}"
 mkdir -p "$REL" && tar -xzf ascend-backend-source.tar.gz -C "$REL"
 mkdir -p /tmp/wh && tar -xzf ascend-wheelhouse-macos-arm64.tar.gz -C /tmp/wh
 

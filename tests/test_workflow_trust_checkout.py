@@ -243,3 +243,66 @@ def test_a_simulated_malicious_candidate_cannot_supply_trust_tools(tmp_path):
     guard_text = (WORKFLOW_DIR / "build-and-attest-backend.yml").read_text()
     assert "the candidate checkout contains trust_tools; refusing" in guard_text
     assert (candidate / "trust_tools").exists(), "the hostile layout the guard must reject"
+
+
+# --------------------------------------------------------------------------------------------
+# release-line ancestry must be proven over the API, never by an authenticated git fetch
+# (run 30578134633 failed because a fetch needed credentials the checkout deliberately lacks)
+
+
+@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
+def test_21_no_authenticated_git_fetch_exists(path: Path):
+    """A fetch from a private remote needs credentials the candidate checkout must not have."""
+    for job_name, job in _jobs(path).items():
+        for step in _steps(job):
+            body = step.get("run") or ""
+            live = [
+                ln for ln in body.splitlines()
+                if not ln.strip().startswith("#") and re.search(r"\bgit\b[^\n]*\bfetch\b", ln)
+            ]
+            assert not live, f"{path.name}:{job_name} performs a git fetch: {live[:2]}"
+
+
+@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda p: p.name)
+def test_22_candidate_checkout_keeps_persist_credentials_false(path: Path):
+    for job_name, job in _jobs(path).items():
+        for step in _steps(job):
+            with_ = step.get("with") or {}
+            if step.get("uses", "").startswith("actions/checkout@"):
+                assert with_.get("persist-credentials") is False, (
+                    f"{path.name}:{job_name} checkout must set persist-credentials: false"
+                )
+
+
+def test_ancestry_uses_the_trust_owned_rest_module():
+    path = WORKFLOW_DIR / "build-and-attest-backend.yml"
+    steps = _steps(_jobs(path)["ancestry"])
+    proof = [s for s in steps if "release-line containment" in (s.get("name") or "")]
+    assert proof, "the ancestry job must prove containment over the REST API"
+    step = proof[0]
+    env = step.get("env") or {}
+    assert env.get("GITHUB_API_TOKEN") == "${{ github.token }}", "token must come from the job token"
+    assert env.get("BACKEND_SHA") == "${{ inputs.backend_sha }}"
+    body = step.get("run") or ""
+    assert "trust/trust_tools/release_line_policy.py" in body
+    # Neither value may be interpolated into shell program text.
+    assert "${{" not in body, "no expression may appear in the ancestry shell body"
+    assert "github.token" not in body
+
+
+def test_no_workflow_configures_git_credentials():
+    for path in WORKFLOWS:
+        text = path.read_text()
+        for forbidden in ("credential.helper", "extraheader", "persist-credentials: true"):
+            live = [ln for ln in text.splitlines() if forbidden in ln and not ln.strip().startswith("#")]
+            assert not live, f"{path.name}: {forbidden} present: {live[:1]}"
+
+
+def test_the_token_is_never_written_to_a_file_or_url():
+    path = WORKFLOW_DIR / "build-and-attest-backend.yml"
+    text = path.read_text()
+    for ln in text.splitlines():
+        if "github.token" in ln and not ln.strip().startswith("#"):
+            assert ln.strip().startswith("GITHUB_API_TOKEN:"), (
+                f"the job token may only be bound to an env var, found: {ln.strip()!r}"
+            )

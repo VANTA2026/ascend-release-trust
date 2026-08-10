@@ -44,8 +44,8 @@ permissions:
 
 env:
   # --- the only release this workflow will build -------------------------------------------
-  REQUIRED_BACKEND_SHA: REQUIRED_BACKEND_SHA: "a7065c653358fa3f687be93d57d9b37e21c8da5d"
-  REQUIRED_RELEASE_REF: REQUIRED_RELEASE_REF: "refs/heads/release/build-616-backend-d2f6"
+  REQUIRED_BACKEND_SHA: "a7065c653358fa3f687be93d57d9b37e21c8da5d"
+  REQUIRED_RELEASE_REF: "refs/heads/release/build-616-backend-d2f6"
   EXPECTED_SOURCE_REPOSITORY: "VANTA2026/ASCEND-OS"
   # --- exact interpreters ------------------------------------------------------------------
   TARGET_RUNTIME_PYTHON: "3.11.15"

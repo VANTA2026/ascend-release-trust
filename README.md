@@ -59,7 +59,7 @@ Given one input — an exact 40-character backend commit SHA, which must equal t
 commit — it:
 
 1. validates every input through trust-owned validators before any value reaches a shell;
-2. **enforces** that the commit is contained in `refs/heads/release/build-616-backend-d1f4`, and
+2. **enforces** that the commit is contained in `refs/heads/release/build-616-backend-d2f6`, and
    fails nonzero if it is not;
 3. builds the source artifact **twice**, on two fresh runners, by exporting exact Git blobs for an
    allowlist of approved paths — not by checking out a worktree, whose bytes `.gitattributes`

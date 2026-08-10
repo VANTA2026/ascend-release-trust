@@ -14,6 +14,8 @@ import re
 import urllib.error
 from pathlib import Path
 
+import urllib.parse
+
 import pytest
 
 import release_line_policy as rl
@@ -85,7 +87,7 @@ def test_identical_status_succeeds():
     assert proof.merge_base_sha == CANDIDATE
     assert proof.candidate_sha == CANDIDATE
     assert proof.repository == "VANTA2026/ASCEND-OS"
-    assert proof.branch == "release/build-616-backend-d1f4"
+    assert proof.branch == rl.EXPECTED_RELEASE_BRANCH
 
 
 def test_ahead_status_succeeds():
@@ -157,7 +159,7 @@ def test_7_wrong_repository_in_response_refuses():
 
 
 def test_8_wrong_branch_in_response_refuses():
-    with pytest.raises(rl.AncestryError, match="expected 'release/build-616-backend-d1f4'"):
+    with pytest.raises(rl.AncestryError, match=f"expected '{re.escape(rl.EXPECTED_RELEASE_BRANCH)}'"):
         rl.prove_release_line_ancestry(CANDIDATE, TOKEN, opener=make_opener(branch=_branch(name="main")))
 
 
@@ -258,7 +260,11 @@ def test_20b_the_module_never_prints_or_persists_the_token():
 
 def test_23_repository_and_branch_are_fixed_constants():
     assert rl.EXPECTED_REPOSITORY == "VANTA2026/ASCEND-OS"
-    assert rl.EXPECTED_RELEASE_BRANCH == "release/build-616-backend-d1f4"
+    # Deliberately a LITERAL. This is the one assertion a trust-root rotation must edit by hand:
+    # deriving it from the module under test would assert only that a constant equals itself, and
+    # the whole claim here is that repository and branch are FIXED trust-owned values rather than
+    # anything a caller can supply. Rotated d1f4 -> d2f6 for the AthleteDay backend cutover.
+    assert rl.EXPECTED_RELEASE_BRANCH == "release/build-616-backend-d2f6"
     import inspect
 
     signature = inspect.signature(rl.prove_release_line_ancestry)
@@ -292,4 +298,6 @@ def test_branch_name_with_a_slash_is_url_encoded():
     rl.prove_release_line_ancestry(CANDIDATE, TOKEN, opener=make_opener(captured=captured))
     branch_calls = [c for c in captured if "/branches/" in c["url"]]
     assert branch_calls, "the branch endpoint must be called"
-    assert "release%2Fbuild-616-backend-d1f4" in branch_calls[0]["url"], branch_calls[0]["url"]
+    expected_encoded = urllib.parse.quote(rl.EXPECTED_RELEASE_BRANCH, safe="")
+    assert "%2F" in expected_encoded, "the fixture must exercise a branch name containing a slash"
+    assert expected_encoded in branch_calls[0]["url"], branch_calls[0]["url"]

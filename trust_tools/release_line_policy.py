@@ -41,7 +41,7 @@ __all__ = [
 
 # Fixed trust-owned constants. NOT caller inputs.
 EXPECTED_REPOSITORY = "VANTA2026/ASCEND-OS"
-EXPECTED_RELEASE_BRANCH = "release/build-616-backend-d1f4"
+EXPECTED_RELEASE_BRANCH = "release/build-616-backend-d2f6"
 
 API_ROOT = "https://api.github.com"
 REQUEST_TIMEOUT_SECONDS = 30

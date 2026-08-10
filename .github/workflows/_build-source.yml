@@ -34,7 +34,7 @@ permissions:
   contents: read
 
 env:
-  REQUIRED_BACKEND_SHA: "50cbe173ea55fea6943c40765ab64dde99406c2e"
+  REQUIRED_BACKEND_SHA: "a7065c653358fa3f687be93d57d9b37e21c8da5d"
   EXPECTED_SOURCE_REPOSITORY: "VANTA2026/ASCEND-OS"
   BUILD_TOOL_PYTHON: "3.13.14"
   LOCKFILE: "requirements.macos-arm64-py311.lock.txt"

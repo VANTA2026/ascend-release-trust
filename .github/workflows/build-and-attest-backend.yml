@@ -36,7 +36,7 @@ on:
       release_name:
         description: "Human label recorded in provenance metadata (strict charset, max 64)"
         required: false
-        default: "build-623-backend-d2f6"
+        default: "build-626-backend-d2f6"
         type: string
 
 permissions:
@@ -44,8 +44,8 @@ permissions:
 
 env:
   # --- the only release this workflow will build -------------------------------------------
-  REQUIRED_BACKEND_SHA: "cd9b42bf1d3506b36012a0f2f09d71f3a59c87e9"
-  REQUIRED_RELEASE_REF: "refs/heads/release/build-623-backend-d2f6"
+  REQUIRED_BACKEND_SHA: "8544673c29779f23c58c5ecee2d2a8b74894e63b"
+  REQUIRED_RELEASE_REF: "refs/heads/release/build-626-backend-d2f6"
   EXPECTED_SOURCE_REPOSITORY: "VANTA2026/ASCEND-OS"
   # --- exact interpreters ------------------------------------------------------------------
   TARGET_RUNTIME_PYTHON: "3.11.15"
